@@ -1,0 +1,26 @@
+{
+  "name": "opencode-sinkhole-guard",
+  "version": "2.0.0",
+  "description": "OpenCode v2 plugin: detects reasoning-sinkhole and context-overflow/OOC sessions on local providers, writes a findings file, recovers the work into a fresh RECOVERED session, and hard-stops the poisoned one.",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "local-llm",
+    "llama-server",
+    "sinkhole",
+    "context-overflow",
+    "recovery",
+    "guard"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ]
+}
