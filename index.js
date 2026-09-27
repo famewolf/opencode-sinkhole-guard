@@ -27,6 +27,7 @@
 // sessions (live verification without burning 131k tokens).
 
 import { writeFileSync, mkdirSync, appendFileSync } from "node:fs";
+import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -61,6 +62,12 @@ const EST_WINDOW = Math.max(1, parseInt(process.env.SINKHOLE_EST_WINDOW || "40",
 // 0 disables the drain (old behavior).
 const DRAIN_WINDOW_MS = parseInt(process.env.SINKHOLE_DRAIN_WINDOW || "60000", 10);
 const DRAIN_MAX = parseInt(process.env.SINKHOLE_DRAIN_MAX || "10", 10);
+// N17: optional post-recovery deletion of the old (poisoned) session, default OFF.
+// When ON and the recovery chain has confirmed the old session is fully stopped
+// (and a recovery session exists to carry the work), the plugin best-effort
+// deletes the old session so it does not linger. Off by default so the
+// contaminated session stays available for the user to review.
+const DELETE_OLD = process.env.SINKHOLE_DELETE_OLD_SESSION === "1";
 const NUDGE_PREFIX = "POISONED SESSION (";
 
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i;
@@ -303,6 +310,54 @@ export default {
     if (MAX_CONTEXT_TOKENS > 0) log("info", `proactive est-tokens check on (limit=${MAX_CONTEXT_TOKENS})`);
     if (FAKE_OOC) log("warn", "FAKE_OOC test mode ON (SINKHOLE_FAKE_OOC=1)");
 
+    // N17: optional post-recovery cleanup of the old (contaminated) session.
+    // Default OFF. Called ONLY from drain.finish once the stop-drain window has
+    // confirmed the old session is quiescent — i.e. no queued user comment
+    // arrived during the window. Deleting earlier (right after the first hard
+    // stop) would break the stop-drain — the very mechanism that captures queued
+    // user comments and forwards them to the recovery session — and could delete
+    // a session the user is still actively commenting on.
+    // Best-effort with a guaranteed manual-cleanup floor:
+    //   S1: ctx.session.delete / .remove (in-process, feature-detect)
+    //   S2: `opencode session delete <id>` (CLI, skipped under the offline harness)
+    //   S3: append a manual-cleanup note to the findings file
+    async function maybeDeleteOld(sid, findingsPath, newSid) {
+      if (!DELETE_OLD) return;
+      log("warn", `${sid}: old-session cleanup requested (SINKHOLE_DELETE_OLD_SESSION=1)`);
+      const note = (line) => {
+        try { appendFileSync(findingsPath, `\n- Old-session cleanup: ${line}\n`); }
+        catch { /* best effort */ }
+      };
+      const del = ["delete", "remove"].map((k) => ctx.session?.[k]).find((f) => typeof f === "function");
+      if (typeof del === "function") {
+        try {
+          await del.call(ctx.session, { sessionID: sid });
+          note(`deleted via ctx.session (recovery session ${newSid} carries the work)`);
+          log("info", `${sid}: old session deleted via ctx.session`);
+          return;
+        } catch (e) {
+          log("warn", `${sid}: ctx.session delete failed: ${e.message}`);
+        }
+      }
+      if (process.env.SINKHOLE_HARNESS !== "1") {
+        try {
+          await new Promise((resolve, reject) => {
+            execFile("opencode", ["session", "delete", sid],
+              { timeout: 10000, maxBuffer: 1024 * 1024 },
+              (error, stdout, stderr) =>
+                error ? reject(new Error(String(stderr || error.message || error).slice(0, 160))) : resolve());
+          });
+          note(`deleted via opencode CLI (recovery session ${newSid} carries the work)`);
+          log("info", `${sid}: old session deleted via opencode CLI`);
+          return;
+        } catch (e) {
+          log("warn", `${sid}: CLI delete failed: ${e.message}`);
+        }
+      }
+      note(`MANUAL: no delete mechanism available in this build - run \`opencode session delete ${sid}\` (or delete in the GUI); recovery session ${newSid} carries the work`);
+      log("warn", `${sid}: old-session cleanup not possible here - manual note appended`);
+    }
+
     // One stop-drain step: first event after the stop learns the user-text
     // baseline (compaction path); afterwards any user text NOT in the baseline
     // is a queued task -> append to the recovery session's todo + re-stop, and
@@ -313,7 +368,7 @@ export default {
         drain.baseline = userTextsOf(messages);
         drain.baselineFetched = true;
         if (drain.deadline) clearTimeout(drain.deadline);
-        drain.deadline = setTimeout(drain.finish, DRAIN_WINDOW_MS);
+        drain.deadline = setTimeout(() => drain.finish(true), DRAIN_WINDOW_MS);
         return;
       }
       let fresh = null;
@@ -345,10 +400,10 @@ export default {
       if (drain.deadline) clearTimeout(drain.deadline);
       if (drain.count >= DRAIN_MAX) {
         log("error", `${sid}: stop-drain max iterations (${DRAIN_MAX}) - MANUAL action may be required`);
-        drain.finish();
+        drain.finish(false);
         return;
       }
-      drain.deadline = setTimeout(drain.finish, DRAIN_WINDOW_MS);
+      drain.deadline = setTimeout(() => drain.finish(true), DRAIN_WINDOW_MS);
     }
 
     async function handlePoison(sid, poison, errText, model, findingsBodyExtra, baselineUserTexts) {
@@ -467,7 +522,7 @@ export default {
           count: 0,
           deadline: null,
         };
-        drain.finish = () => {
+        drain.finish = (quiescent) => {
           if (drain.deadline) { clearTimeout(drain.deadline); drain.deadline = null; }
           drainRegistry.delete(sid);
           try {
@@ -475,9 +530,16 @@ export default {
               `\n- Stop-drain: ${drain.count} queued task(s) absorbed into ${drain.newSid}; old session ${sid} fully stopped.\n`);
           } catch { /* best effort */ }
           log("info", `${sid}: stop-drain complete (${drain.count} queued task(s) absorbed)`);
+          // N17: only delete the old session once stop-drain confirms it is
+          // QUIESCENT (window closed with no further queued user comment). The
+          // max-iterations path calls finish(false) — the session may still be
+          // receiving comments, so it is NOT quiescent and is left for manual
+          // review (this is also what keeps the old session available so the
+          // user can see exactly what happened before it was removed).
+          if (quiescent) maybeDeleteOld(sid, drain.findingsPath, drain.newSid);
         };
         drainRegistry.set(sid, drain);
-        drain.deadline = setTimeout(drain.finish, DRAIN_WINDOW_MS);
+        drain.deadline = setTimeout(() => drain.finish(true), DRAIN_WINDOW_MS);
         log("info", `${sid}: stop-drain armed (window=${DRAIN_WINDOW_MS}ms, max=${DRAIN_MAX})`);
       }
 

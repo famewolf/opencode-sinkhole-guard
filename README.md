@@ -44,6 +44,11 @@ The combined effect of a broken retry counter in the auto-resume plugin plus a c
    just-stopped session; each is absorbed into the recovery session and
    answered with another stop.
 6. Appends the recovery chain's result (new session id) to the findings file.
+7. **Optional cleanup** (`SINKHOLE_DELETE_OLD_SESSION=1`, off by default): once the
+   old session is confirmed fully stopped (the stop-drain window has expired
+   *quiescently* — never while queued tasks are still being absorbed), the old
+   session is deleted; the RECOVERED session carries the work. It stays off by
+   default so the poisoned session remains available to review what happened.
 
 The work is not lost — it is handed to a clean session that starts with a tiny context and reads the findings.
 
@@ -92,8 +97,12 @@ All optional; sensible defaults shown.
 | `SINKHOLE_EST_WINDOW` | `40` | Number of most-recent messages counted by the est-tokens estimate (the effective post-compaction window — v2 context events carry the full history, so a full-history sum over-counts). |
 | `SINKHOLE_DRAIN_WINDOW` | `60000` | Stop-drain window in ms after each stop (0 = off, old behavior). |
 | `SINKHOLE_DRAIN_MAX` | `10` | Max drain iterations before a manual-action warning. |
+| `SINKHOLE_DELETE_OLD_SESSION` | `0` (off) | Optional post-recovery cleanup: delete the old (poisoned) session once it is confirmed fully stopped (quiescent stop-drain expiry; never on the max-iterations path). Deletion tries `ctx.session.delete`, then the `opencode` CLI; if this build exposes neither, a MANUAL-cleanup note is appended to the findings. Off by default so the old session stays available for review. |
 | `SINKHOLE_FINDINGS_DIR` | `~/opencode/findings/` | Where findings files are written. |
 | `SINKHOLE_FAKE_OOC` | `0` | **Test mode** — force an OOC on the first local turn (used by the live probe). Never enable in real use. |
+
+If the number of knobs keeps growing, these may move into a dedicated
+`sinkhole-guard` settings file; for now every option is a plain env var.
 
 ## Installation
 
@@ -111,7 +120,7 @@ The plugin loads on server start (and is hot-reloaded when `opencode.jsonc` chan
 
 ## Verification
 
-- **Offline harness** (`guard_v2_harness.mjs`): 30 assertions covering v1 + v2 message shapes, sinkhole/overflow/OOC detection, the full recovery chain, and the FAKE_OOC path — all pass.
+- **Offline harness** (`guard_v2_harness.mjs`): 37 assertions across three passes — v1 + v2 message shapes, sinkhole/overflow/OOC detection, the full recovery chain, the FAKE_OOC path, and the optional old-session delete (S1 `ctx.session.delete` + S3 MANUAL-fallback) — all pass.
 - **Live probe** (standalone OpenCode v2 server, `SINKHOLE_FAKE_OOC=1`): the full chain fired end-to-end — findings written, a RECOVERED session created and seeded with the findings pointer, a `task_complete` nudge injected, and the poisoned session hard-stopped.
 
 ## Relation to `opencode-auto-resume`
