@@ -40,13 +40,46 @@ const OUTPUT_CAP_TOKENS = parseInt(process.env.SINKHOLE_OUTPUT_CAP || "4096", 10
 const MIN_REASONING_CHARS = parseInt(process.env.SINKHOLE_MIN_REASONING || "200", 10);
 const REASONING_FLOOR = parseInt(process.env.SINKHOLE_REASONING_FLOOR || "12000", 10);
 const FAKE_OOC = process.env.SINKHOLE_FAKE_OOC === "1";
-const MAX_CONTEXT_TOKENS = parseInt(process.env.SINKHOLE_MAX_CONTEXT || "0", 10); // 0 = proactive est-tokens check off
+// Proactive est-tokens check. 2026-09-27: the 120000 default caused a false
+// positive — estTokens() summed the FULL history of v2 context events
+// (including pre-compaction messages the model no longer sees), so a healthy
+// 47%-full session over-counted to ~175k and was hard-stopped with a duplicate
+// recovery session. Fix (same day): estTokens() now counts only the last
+// SINKHOLE_EST_WINDOW (40) messages — the effective post-compaction window
+// (that event: last-40 ≈57k vs UI 47% of the 128k window ≈60k) — and
+// opencode.jsonc sets SINKHOLE_MAX_CONTEXT=106000 (≈83% of the 128k window;
+// effective fire point ~100.7k, below native compaction ~119k).
+const MAX_CONTEXT_TOKENS = parseInt(process.env.SINKHOLE_MAX_CONTEXT || "0", 10);
+const EST_WINDOW = Math.max(1, parseInt(process.env.SINKHOLE_EST_WINDOW || "40", 10));
+
+// Stop-drain (2026-09-27): a queued user task (OpenChamber queues prompts while
+// the session is busy) can be delivered the moment the old session is
+// interrupted — the interrupt is treated as "free" and the queued task starts a
+// new run. The guard then watches the old session for DRAIN_WINDOW_MS after
+// each stop: every new user message is appended to the recovery session's todo
+// list and answered with another stop, until the old session stays stopped.
+// 0 disables the drain (old behavior).
+const DRAIN_WINDOW_MS = parseInt(process.env.SINKHOLE_DRAIN_WINDOW || "60000", 10);
+const DRAIN_MAX = parseInt(process.env.SINKHOLE_DRAIN_MAX || "10", 10);
+const NUDGE_PREFIX = "POISONED SESSION (";
 
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i;
 const OVERFLOW_RE = /overflow|context exceeds|too large to compact/i;
 const TOOL_PART_TYPES = ["tool", "tool-result", "tool-call"];
 
 const recovered = new Set();
+
+// Stop-drain state: sessionID -> drain state. Populated by handlePoison right
+// after a hard stop; the context hook routes that session's events through
+// drainStep (defined in setup, where ctx is in scope) until the session stays
+// stopped for one drain window. (2026-09-27: this registry was once
+// referenced-but-undefined, crashing every reply with
+// "ReferenceError: drainRegistry is not defined".)
+const drainRegistry = new Map();
+
+// Title-probe flag: flipped true after the one-time ctx.session.get/list shape
+// probe in the context hook (debug helper for the recovery-session title work).
+let titleProbed = false;
 
 function log(level, msg) {
   const line = `${LOG_PREFIX} ${level}: ${msg}`;
@@ -92,6 +125,19 @@ function partErrorText(p) {
     return texts.join(" ");
   }
   return "";
+}
+
+function userTextsOf(messages) {
+  // Set of trimmed user-message texts in a context event (v2 content parts or
+  // v1-style .info.content). Used to detect queued user tasks that arrive on a
+  // hard-stopped session: a user text not in the detection-time baseline is new.
+  const out = new Set();
+  for (const m of messages || []) {
+    if (roleOf(m) !== "user") continue;
+    const t = (partsOf(m).map(partText).join(" ") || m?.info?.content || m?.text || "").trim();
+    if (t) out.add(t);
+  }
+  return out;
 }
 
 function partIsError(p) {
@@ -182,9 +228,12 @@ function countOverflow(messages) {
   return count;
 }
 
+// Effective-window token estimate: counts only the last EST_WINDOW messages
+// (the effective post-compaction window — see SINKHOLE_MAX_CONTEXT comment
+// above for why a full-history sum over-counts on v2 context events).
 function estTokens(messages) {
   let chars = 0;
-  for (const m of messages) {
+  for (const m of messages.slice(-EST_WINDOW)) {
     for (const p of partsOf(m)) {
       if (p?.type === "text" || p?.type === "reasoning") chars += (p.text || "").length;
       else if (TOOL_PART_TYPES.includes(p?.type)) chars += JSON.stringify(p.state || p.result || "").length;
@@ -199,6 +248,49 @@ function providerOf(model) {
   return model?.providerID || "";
 }
 
+// Recovery-session title: "RECOVERED: <old session title>" (user requirement
+// 2026-09-27). A RECOVERED:-prefixed old title is stripped first so we never
+// produce "RECOVERED: RECOVERED: X"; if the title is already taken by another
+// session, " 2", " 3", ... is appended. Any API failure falls back to the
+// id-based title (previous behavior), and nothing here may throw.
+async function recoveryTitleFor(ctx, sid, poison) {
+  const fallback = `RECOVERED: ${poison} in ${sid}`;
+  let oldTitle = null;
+  try {
+    if (typeof ctx.session?.get === "function") {
+      const s = await ctx.session.get({ sessionID: sid });
+      if (s && typeof s.title === "string" && s.title) oldTitle = s.title;
+    }
+  } catch (e) {
+    log("info", "recoveryTitleFor get err: " + e.message);
+  }
+  if (!oldTitle) {
+    try {
+      const all = typeof ctx.session?.list === "function" ? await ctx.session.list() : null;
+      const hit = Array.isArray(all) ? all.find(s => s && s.id === sid) : null;
+      if (hit && typeof hit.title === "string" && hit.title) oldTitle = hit.title;
+    } catch (e) {
+      log("info", "recoveryTitleFor list err: " + e.message);
+    }
+  }
+  const clean = oldTitle ? oldTitle.replace(/^(?:RECOVERED:\s*)+/, "").trim() : "";
+  if (!clean) return fallback;
+  let title = `RECOVERED: ${clean}`;
+  try {
+    const all = typeof ctx.session?.list === "function" ? await ctx.session.list() : null;
+    const taken = new Set();
+    if (Array.isArray(all)) for (const s of all) if (s && typeof s.title === "string") taken.add(s.title);
+    let n = 1;
+    while (taken.has(title) && n < 50) {
+      n++;
+      title = `RECOVERED: ${clean} ${n}`;
+    }
+  } catch (e) {
+    log("info", "recoveryTitleFor dedupe err: " + e.message);
+  }
+  return title;
+}
+
 export default {
   id: "sinkhole-guard",
   setup: async (ctx) => {
@@ -207,10 +299,59 @@ export default {
 
     const hasCreate = typeof ctx.session?.create === "function";
     if (!hasCreate) log("warn", "ctx.session.create unavailable - recovery-session chain disabled (findings + hard-stop only)");
+    log("info", "ctx.session fns: " + Object.keys(ctx.session || {}).filter(k => typeof ctx.session[k] === "function").join(","));
     if (MAX_CONTEXT_TOKENS > 0) log("info", `proactive est-tokens check on (limit=${MAX_CONTEXT_TOKENS})`);
     if (FAKE_OOC) log("warn", "FAKE_OOC test mode ON (SINKHOLE_FAKE_OOC=1)");
 
-    async function handlePoison(sid, poison, errText, model, findingsBodyExtra) {
+    // One stop-drain step: first event after the stop learns the user-text
+    // baseline (compaction path); afterwards any user text NOT in the baseline
+    // is a queued task -> append to the recovery session's todo + re-stop, and
+    // reset the window. Window expiry calls drain.finish (registry cleanup +
+    // findings note).
+    async function drainStep(sid, drain, messages) {
+      if (!drain.baselineFetched) {
+        drain.baseline = userTextsOf(messages);
+        drain.baselineFetched = true;
+        if (drain.deadline) clearTimeout(drain.deadline);
+        drain.deadline = setTimeout(drain.finish, DRAIN_WINDOW_MS);
+        return;
+      }
+      let fresh = null;
+      for (const t of userTextsOf(messages)) {
+        if (!drain.baseline.has(t) && !t.startsWith(NUDGE_PREFIX) && !t.startsWith("DRAIN:")) {
+          fresh = t;
+          break;
+        }
+      }
+      if (!fresh) return;
+      drain.baseline.add(fresh);
+      drain.count++;
+      log("warn", `${sid}: queued user task during stop (drain #${drain.count}): ${fresh.slice(0, 120)}`);
+      try {
+        await ctx.session.prompt({
+          sessionID: drain.newSid,
+          text: `DRAIN: the poisoned session ${sid} just received this queued user task while we were stopping it. Add it to the BOTTOM of your todo list (process it after your current work if they conflict), then continue: ${fresh.slice(0, 2000)}`,
+        });
+        log("info", `${sid}: queued task appended to recovery session ${drain.newSid}`);
+      } catch (e) {
+        log("error", `${sid}: could not append queued task to recovery session: ${e.message}`);
+      }
+      try {
+        await ctx.session.interrupt({ sessionID: sid });
+        log("warn", `${sid}: re-stopped (drain #${drain.count})`);
+      } catch (e) {
+        log("warn", `${sid}: re-stop failed: ${e.message}`);
+      }
+      if (drain.deadline) clearTimeout(drain.deadline);
+      if (drain.count >= DRAIN_MAX) {
+        log("error", `${sid}: stop-drain max iterations (${DRAIN_MAX}) - MANUAL action may be required`);
+        drain.finish();
+        return;
+      }
+      drain.deadline = setTimeout(drain.finish, DRAIN_WINDOW_MS);
+    }
+
+    async function handlePoison(sid, poison, errText, model, findingsBodyExtra, baselineUserTexts) {
       log("warn", `${sid}: poison=${poison}${errText ? ` err=${errText.slice(0, 120)}` : ""}`);
       recovered.add(sid);
 
@@ -261,8 +402,10 @@ export default {
         return;
       }
 
-      // Unrecoverable classes (overflow / ooc): fresh-session chain
-      const title = `RECOVERED: ${poison} in ${sid}`;
+      // Unrecoverable classes (overflow / ooc): fresh-session chain.
+      // Title: "RECOVERED: <old session title>" (numbered on duplicate,
+      // RECOVERED:-prefix stripped; id-based fallback if API unavailable).
+      const title = await recoveryTitleFor(ctx, sid, poison);
       let newSid = null;
       let seeded = false;
 
@@ -310,6 +453,34 @@ export default {
         log("warn", `${sid}: interrupt failed: ${e.message}`);
       }
 
+      // Stop-drain: queued user tasks can be delivered the moment the
+      // interrupt lands (the interrupt counts as "free"), re-activating the
+      // dead session. While the drain window is open, every new user message
+      // on the old session is appended to the recovery session's todo list and
+      // answered with another stop, until the session stays stopped.
+      if (DRAIN_WINDOW_MS > 0 && newSid) {
+        const drain = {
+          newSid,
+          findingsPath,
+          baseline: new Set(baselineUserTexts || []),
+          baselineFetched: baselineUserTexts != null,
+          count: 0,
+          deadline: null,
+        };
+        drain.finish = () => {
+          if (drain.deadline) { clearTimeout(drain.deadline); drain.deadline = null; }
+          drainRegistry.delete(sid);
+          try {
+            appendFileSync(drain.findingsPath,
+              `\n- Stop-drain: ${drain.count} queued task(s) absorbed into ${drain.newSid}; old session ${sid} fully stopped.\n`);
+          } catch { /* best effort */ }
+          log("info", `${sid}: stop-drain complete (${drain.count} queued task(s) absorbed)`);
+        };
+        drainRegistry.set(sid, drain);
+        drain.deadline = setTimeout(drain.finish, DRAIN_WINDOW_MS);
+        log("info", `${sid}: stop-drain armed (window=${DRAIN_WINDOW_MS}ms, max=${DRAIN_MAX})`);
+      }
+
       try {
         appendFileSync(findingsPath,
           `\n## Chain result\n` +
@@ -323,7 +494,26 @@ export default {
       if (Date.now() < startupDeadline) return;
 
       const sid = event.sessionID;
-      if (!sid || recovered.has(sid)) return;
+      if (!sid) return;
+      if (!titleProbed) {
+        titleProbed = true;
+        try {
+          if (typeof ctx.session?.get === "function") {
+            const s = await ctx.session.get({ sessionID: sid });
+            log("info", "session.get shape: " + JSON.stringify(Object.keys(s || {})) + " title=" + JSON.stringify((s || {}).title));
+          }
+          const all = await ctx.session.list();
+          log("info", "session.list n=" + (Array.isArray(all) ? all.length : "?") + " entryKeys=" + JSON.stringify(Object.keys(Array.isArray(all) && all[0] ? all[0] : {})));
+        } catch (e) {
+          log("info", "title probe err: " + e.message);
+        }
+      }
+      const drain = drainRegistry.get(sid);
+      if (drain) {
+        await drainStep(sid, drain, event.messages || []);
+        return;
+      }
+      if (recovered.has(sid)) return;
 
       // Only evaluate for local providers
       const provider = providerOf(event.model);
@@ -347,7 +537,7 @@ export default {
       if (!poison) return;
 
       const errText = overflowCount > 0 ? extractOverflowError(messages) : oocErr;
-      await handlePoison(sid, poison, errText, event.model);
+      await handlePoison(sid, poison, errText, event.model, null, userTextsOf(messages));
     });
 
     // OOC via failed auto-compaction (v2: context events carry no message-level
@@ -361,7 +551,7 @@ export default {
         const errText = evErr ? (typeof evErr === "string" ? evErr : evErr.message || evErr.type || JSON.stringify(evErr).slice(0, 300)) : "";
         if (!OOC_ERROR_RE.test(errText)) return;
         log("warn", `${sid}: OOC via compaction event: ${errText.slice(0, 160)}`);
-        await handlePoison(sid, "ooc", errText.slice(0, 300), event?.model || null);
+        await handlePoison(sid, "ooc", errText.slice(0, 300), event?.model || null, null, null);
       });
     } catch (e) {
       log("warn", `compaction hook unavailable: ${e.message}`);

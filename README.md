@@ -37,9 +37,13 @@ The combined effect of a broken retry counter in the auto-resume plugin plus a c
 ### For **overflow / OOC** (unrecoverable in-place) — the recovery chain:
 1. **Writes a findings file** to `SINKHOLE_FINDINGS_DIR` (default `~/opencode/findings/`): `ooc_<session>_<timestamp>.md` with the error, model, and what to do next.
 2. **Creates a fresh "RECOVERED" session** (via `ctx.session.create`) whose first message points it at that findings file: *"Read the findings file FIRST … then continue the work described there."*
+   **Title:** `RECOVERED: <old session title>` (looked up via `ctx.session.get`, falling back to `list`). A `RECOVERED:-`-prefixed old title is stripped first (never `RECOVERED: RECOVERED: X`); if the title is already taken, ` 2`, ` 3`, … is appended. If the title API is unavailable, falls back to `RECOVERED: <pattern> in <session-id>`.
 3. Sends a best-effort **`task_complete`** nudge to the old (poisoned) session.
 4. **Hard-stops the old session** (`ctx.session.interrupt`).
-5. Appends the recovery chain's result (new session id) to the findings file.
+5. **Arms the stop-drain** (see below): queued user tasks can re-activate the
+   just-stopped session; each is absorbed into the recovery session and
+   answered with another stop.
+6. Appends the recovery chain's result (new session id) to the findings file.
 
 The work is not lost — it is handed to a clean session that starts with a tiny context and reads the findings.
 
@@ -47,6 +51,31 @@ The work is not lost — it is handed to a clean session that starts with a tiny
 It injects a single corrective prompt nudge (no new session, no hard-stop) — the model is usually just stuck and a nudge gets it moving again.
 
 A session that has already been recovered is remembered (per-run) and never re-triggered.
+
+### Stop-drain: queued tasks that re-activate a stopped session
+
+When a poisoned session is hard-stopped, user prompts that were queued while it
+was busy (OpenChamber queues prompts until a session goes idle) can be delivered
+the moment it becomes "free" — the interrupt itself counts as free — and start
+a new run on the dead session, where they would spin until the next OOM and
+could trigger a *second* recovery session.
+
+While `SINKHOLE_DRAIN_WINDOW` is open after every stop, the guard watches the
+old session:
+
+- any **new** user message (not present at stop time) is appended to the
+  recovery session's todo list — *"add this task to the BOTTOM of your todo
+  list"* — and the old session is **interrupted again**;
+- the window resets with every absorbed task and closes when the old session
+  stays stopped for one full window; the outcome is appended to the findings
+  file (`Stop-drain: N queued task(s) absorbed … fully stopped`).
+
+Baseline = the user-message texts present in the detection-time context event
+(the compaction path learns the baseline from the first context event after
+the stop). The `task_complete` nudge and drain prompts are excluded by prefix.
+Caveats: re-sending an old task's *exact* text is not treated as new, and if a
+queued task arrives before the nudge run it may execute once on the old
+session.
 
 ## Configuration (env vars)
 
@@ -59,7 +88,10 @@ All optional; sensible defaults shown.
 | `SINKHOLE_OUTPUT_CAP` | `4096` | Output token cap used to spot a truncated (length) turn. |
 | `SINKHOLE_MIN_REASONING` | `200` | Minimum reasoning chars to count a turn as "reasoning-only". |
 | `SINKHOLE_REASONING_FLOOR` | `12000` | v2: reasoning chars at/above which a turn counts as a sinkhole turn. |
-| `SINKHOLE_MAX_CONTEXT` | `0` (off) | v2: proactive check — estimated tokens at/above this trips OOC *before* the 400. |
+| `SINKHOLE_MAX_CONTEXT` | `0` (off) | v2: proactive check — effective-window est-tokens above 95% of this trips OOC *before* the provider's 400. **Re-enabled 2026-09-27 at `106000`** (≈83% of the 128k window; fires ~100.7k, below native compaction ~119k) after the estimator was fixed — the earlier FP (full-history over-count of a healthy 47%-full session) cannot recur. |
+| `SINKHOLE_EST_WINDOW` | `40` | Number of most-recent messages counted by the est-tokens estimate (the effective post-compaction window — v2 context events carry the full history, so a full-history sum over-counts). |
+| `SINKHOLE_DRAIN_WINDOW` | `60000` | Stop-drain window in ms after each stop (0 = off, old behavior). |
+| `SINKHOLE_DRAIN_MAX` | `10` | Max drain iterations before a manual-action warning. |
 | `SINKHOLE_FINDINGS_DIR` | `~/opencode/findings/` | Where findings files are written. |
 | `SINKHOLE_FAKE_OOC` | `0` | **Test mode** — force an OOC on the first local turn (used by the live probe). Never enable in real use. |
 
