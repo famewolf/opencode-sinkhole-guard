@@ -6,9 +6,13 @@
 //
 // Detection logic:
 //   - "sinkhole": N recent assistant turns with huge reasoning and zero
-//     visible text/tool output -> context is poisoned. (v1 shape: finish=length
-//     budget consumed; v2 shape: no finish in context events, so a
-//     SINKHOLE_REASONING_FLOOR-char reasoning-only heuristic is used instead.)
+//     visible text/tool output -> context is poisoned. Strict zero-text:
+//     thinking models narrate tersely while working, so any non-blank text
+//     breaks the streak (2026-10-10). Completed tool results in the window
+//     veto outright (work is being done); error results do not. (v1 shape:
+//     finish=length budget consumed; v2 shape: no finish in context events,
+//     so a SINKHOLE_REASONING_FLOOR-char reasoning-only heuristic is used
+//     instead.)
 //   - "overflow": recent tool results with ContextOverflowError-style error
 //     text -> session exceeds model context limit.
 //   - "ooc": message-level error matching the OOC pattern (v1 shape:
@@ -71,18 +75,46 @@ const DELETE_OLD = process.env.SINKHOLE_DELETE_OLD_SESSION === "1";
 const NUDGE_PREFIX = "POISONED SESSION (";
 
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i;
+// Transient throttles must never verdict as OOC (issue #46). Kept in parity
+// with auto-resume's RATE_LIMIT_RE: rate-limit-shaped text is exempted in
+// isOocTurn and the compaction hook below.
+const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota exceeded|provider\.quota|throttl|slow down|please wait|try again later|too many tokens.{0,120}(short period|wait|retr|throttl|slow|per (second|minute|hour|day)|rate|limit|quota)/i;
 const OVERFLOW_RE = /overflow|context exceeds|too large to compact/i;
 const TOOL_PART_TYPES = ["tool", "tool-result", "tool-call"];
 
-const recovered = new Set();
+// Cross-setup state (2026-10-10): the loader re-evaluates this file per
+// session attach/restore — same churn exposure proven on auto-resume
+// (138 supersedes in a day). Module-scope Maps wipe on every
+// re-evaluation: recovered sessions re-fire (nag storms) and in-flight
+// drains orphan (queued tasks unforwarded, old session never re-stopped).
+// Both maps live on globalThis and survive; drain.finish is guarded by
+// identity so a stale copy's timer no-ops instead of double-handling.
+const SG_REG_KEY = "__sinkhole_guard_state__";
+function sgState() {
+  const g = globalThis;
+  let s = g[SG_REG_KEY];
+  if (!s || !(s.recovered instanceof Map) || !(s.drains instanceof Map)) {
+    s = { recovered: new Map(), drains: new Map() };
+    g[SG_REG_KEY] = s;
+  }
+  return s;
+}
+// Minimum quiet period before the same session may fire again. A still-broken
+// session re-fires after this (with a fresh findings file); anything sooner
+// is the same episode echoing through churn, not new evidence.
+const RECOVER_COOLDOWN_MS = parseInt(process.env.SINKHOLE_RECOVER_COOLDOWN || String(30 * 60 * 1000), 10);
+function alreadyRecovered(sid) {
+  const t = sgState().recovered.get(sid);
+  return typeof t === "number" && Date.now() - t < RECOVER_COOLDOWN_MS;
+}
+function markRecovered(sid) {
+  sgState().recovered.set(sid, Date.now());
+}
 
-// Stop-drain state: sessionID -> drain state. Populated by handlePoison right
-// after a hard stop; the context hook routes that session's events through
-// drainStep (defined in setup, where ctx is in scope) until the session stays
-// stopped for one drain window. (2026-09-27: this registry was once
-// referenced-but-undefined, crashing every reply with
-// "ReferenceError: drainRegistry is not defined".)
-const drainRegistry = new Map();
+// Stop-drain state lives in sgState().drains (see above): module scope would
+// orphan in-flight drains on re-evaluation (queued tasks unforwarded).
+// (2026-09-27: this registry was once referenced-but-undefined, crashing
+// every reply with "ReferenceError: drainRegistry is not defined".)
 
 // Title-probe flag: flipped true after the one-time ctx.session.get/list shape
 // probe in the context hook (debug helper for the recovery-session title work).
@@ -160,8 +192,12 @@ function isReasoningOnlyTurn(msg) {
   const parts = partsOf(msg);
   // Has any tool call?
   if (parts.some(p => TOOL_PART_TYPES.includes(p?.type))) return false;
-  // Has any visible text output (not just reasoning)?
-  if (parts.some(p => partText(p).length > MIN_REASONING_CHARS)) return false;
+  // Has any visible text output (not just reasoning)? Strict: the recovery
+  // message itself claims "no visible output", and thinking models narrate
+  // tersely while working ("Probing it:" + 15k thinking tripped this on
+  // ses_eda19dc9, 2026-10-10). Any non-blank text breaks the streak.
+  // (MIN_REASONING_CHARS retained for env compat; no longer gates.)
+  if (parts.some(p => partText(p).trim().length > 0)) return false;
   // v1 shape: output budget consumed
   if (finishOf(msg) === "length") return true;
   // v2 shape: context events carry no finish - huge reasoning-only turn heuristic
@@ -202,7 +238,9 @@ function oocErrorText(msg) {
 function isOocTurn(msg) {
   if (roleOf(msg) !== "assistant") return false;
   if (finishOf(msg) !== "error") return false;
-  return OOC_ERROR_RE.test(oocErrorText(msg));
+  const text = oocErrorText(msg);
+  if (RATE_LIMIT_RE.test(text)) return false;
+  return OOC_ERROR_RE.test(text);
 }
 
 function lastAssistant(messages) {
@@ -213,8 +251,25 @@ function lastAssistant(messages) {
 }
 
 // Count recent reasoning-only assistant turns (tool/user messages between them
-// do not break the streak - v2 interleaves role=tool messages).
+// do not break the streak - v2 interleaves role=tool messages). Successful
+// tool RESULTS in the window veto the verdict: a model getting work done
+// through tools is progressing, not sinkholed (ses_eda19dc9, 2026-10-10 —
+// "3 actions" then a false fire). Error results do not veto: a loop of
+// failing tools plus reasoning is stuck, not working.
+function hasRecentToolSuccess(messages, windowMsgs) {
+  const win = messages.slice(-windowMsgs);
+  for (const m of win) {
+    if (roleOf(m) !== "tool") continue;
+    for (const p of partsOf(m)) {
+      if (!TOOL_PART_TYPES.includes(p?.type)) continue;
+      if (partIsError(p)) continue;
+      return true;
+    }
+  }
+  return false;
+}
 function countSinkhole(messages) {
+  if (hasRecentToolSuccess(messages, SINKHOLE_TURNS * 4)) return 0;
   let count = 0;
   for (let i = messages.length - 1; i >= 0 && count < SINKHOLE_TURNS; i--) {
     const role = roleOf(messages[i]);
@@ -323,7 +378,8 @@ export default {
   id: "sinkhole-guard",
   setup: async (ctx) => {
     ensureFindingsDir();
-    const startupDeadline = Date.now() + 5000;
+    // Zero in harness mode so tests need no 5s sleep per setup.
+    const startupDeadline = Date.now() + (process.env.SINKHOLE_HARNESS === "1" ? 0 : 5000);
 
     const hasCreate = typeof ctx.session?.create === "function";
     if (!hasCreate) log("warn", "ctx.session.create unavailable - recovery-session chain disabled (findings + hard-stop only)");
@@ -429,7 +485,7 @@ export default {
 
     async function handlePoison(sid, poison, errText, model, findingsBodyExtra, baselineUserTexts) {
       log("warn", `${sid}: poison=${poison}${errText ? ` err=${errText.slice(0, 120)}` : ""}`);
-      recovered.add(sid);
+      markRecovered(sid);
 
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const findingsPath = join(findingsDir, `${poison}_${sid}_${stamp}.md`);
@@ -462,7 +518,7 @@ export default {
         log("info", `${sid}: findings written to ${findingsPath}`);
       } catch (e) {
         log("error", `${sid}: could not write findings: ${e.message}`);
-        recovered.delete(sid);
+        sgState().recovered.delete(sid);
         return;
       }
 
@@ -568,7 +624,10 @@ export default {
         };
         drain.finish = (quiescent) => {
           if (drain.deadline) { clearTimeout(drain.deadline); drain.deadline = null; }
-          drainRegistry.delete(sid);
+          // Stale-copy guard: a re-evaluated module's timer must not finish a
+          // drain another copy owns (or re-finish an already-closed one).
+          if (sgState().drains.get(sid) !== drain) return;
+          sgState().drains.delete(sid);
           try {
             appendFileSync(drain.findingsPath,
               `\n- Stop-drain: ${drain.count} queued task(s) absorbed into ${drain.newSid}; old session ${sid} fully stopped.\n`);
@@ -582,7 +641,7 @@ export default {
           // user can see exactly what happened before it was removed).
           if (quiescent) maybeDeleteOld(sid, drain.findingsPath, drain.newSid);
         };
-        drainRegistry.set(sid, drain);
+        sgState().drains.set(sid, drain);
         drain.deadline = setTimeout(() => drain.finish(true), DRAIN_WINDOW_MS);
         log("info", `${sid}: stop-drain armed (window=${DRAIN_WINDOW_MS}ms, max=${DRAIN_MAX})`);
       }
@@ -614,12 +673,12 @@ export default {
           log("info", "title probe err: " + e.message);
         }
       }
-      const drain = drainRegistry.get(sid);
+      const drain = sgState().drains.get(sid);
       if (drain) {
         await drainStep(sid, drain, event.messages || []);
         return;
       }
-      if (recovered.has(sid)) return;
+      if (alreadyRecovered(sid)) return;
 
       // Only evaluate for local providers
       const provider = providerOf(event.model);
@@ -652,9 +711,10 @@ export default {
       await ctx.session.hook("compaction", async (event) => {
         if (Date.now() < startupDeadline) return;
         const sid = event?.sessionID;
-        if (!sid || recovered.has(sid)) return;
+        if (!sid || alreadyRecovered(sid)) return;
         const evErr = event?.error ?? event?.data?.error;
         const errText = evErr ? (typeof evErr === "string" ? evErr : evErr.message || evErr.type || JSON.stringify(evErr).slice(0, 300)) : "";
+        if (RATE_LIMIT_RE.test(errText)) return;
         if (!OOC_ERROR_RE.test(errText)) return;
         log("warn", `${sid}: OOC via compaction event: ${errText.slice(0, 160)}`);
         await handlePoison(sid, "ooc", errText.slice(0, 300), event?.model || null, null, null);
