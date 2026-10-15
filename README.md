@@ -38,6 +38,7 @@ The combined effect of a broken retry counter in the auto-resume plugin plus a c
 1. **Writes a findings file** to `SINKHOLE_FINDINGS_DIR` (default `~/opencode/findings/`): `ooc_<session>_<timestamp>.md` with the error, model, and what to do next.
 2. **Creates a fresh "RECOVERED" session** (via `ctx.session.create`) whose first message points it at that findings file: *"Read the findings file FIRST … then continue the work described there."*
    **Title:** `RECOVERED: <old session title>` (looked up via `ctx.session.get`, falling back to `list`). A `RECOVERED:-`-prefixed old title is stripped first (never `RECOVERED: RECOVERED: X`); if the title is already taken, ` 2`, ` 3`, … is appended. If the title API is unavailable, falls back to `RECOVERED: <pattern> in <session-id>`.
+   **Model/agent:** the recovery session inherits the poisoned session's pair (read from the same `session.get`), so the work continues in the same configuration. The pair is passed at creation and verified after (repaired via `switchAgent`/`switchModel` when an adapter drops the fields); every step degrades to omit-and-continue.
 3. Sends a best-effort **`task_complete`** nudge to the old (poisoned) session.
 4. **Hard-stops the old session** (`ctx.session.interrupt`).
 5. **Arms the stop-drain** (see below): queued user tasks can re-activate the
@@ -106,7 +107,20 @@ If the number of knobs keeps growing, these may move into a dedicated
 
 ## Installation
 
-Drop the directory into your OpenCode plugins folder and register it in `opencode.jsonc`:
+**Quick method (recommended):** download `index.js` from the latest
+[release](https://github.com/famewolf/opencode-sinkhole-guard/releases),
+drop it in a folder (e.g. `~/.config/opencode-v2/opencode/plugins/sinkhole-guard/`),
+register it (below), restart the server.
+
+**Manual method:** clone the repo, no build step (single-file plugin —
+`index.js` is the source):
+
+```sh
+git clone https://github.com/famewolf/opencode-sinkhole-guard.git
+cp opencode-sinkhole-guard/index.js ~/.config/opencode-v2/opencode/plugins/sinkhole-guard/index.js
+```
+
+Register it in `opencode.jsonc` (either method):
 
 ```jsonc
 {

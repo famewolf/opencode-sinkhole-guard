@@ -298,6 +298,27 @@ async function recoveryTitleFor(ctx, sid, poison) {
   return title;
 }
 
+// Recovery-session model/agent: inherit the poisoned session's pair so the
+// recovery continues in the same configuration (same brain, same behavior).
+// Read from session.get (SessionInfo carries both); every step degrades to
+// omit-and-continue. Verified 2026-10-15 against the live API: create honors
+// {agent, model}, and the switches are independent (neither resets the other).
+async function recoveryPairFor(ctx, sid) {
+  const pair = {};
+  try {
+    if (typeof ctx.session?.get !== "function") return pair;
+    const s = await ctx.session.get({ sessionID: sid });
+    if (s && typeof s.agent === "string" && s.agent) pair.agent = s.agent;
+    const m = s ? s.model : null;
+    if (m && typeof m.providerID === "string" && typeof m.id === "string") {
+      pair.model = { providerID: m.providerID, id: m.id };
+    }
+  } catch (e) {
+    log("info", "recoveryPairFor get err: " + e.message);
+  }
+  return pair;
+}
+
 export default {
   id: "sinkhole-guard",
   setup: async (ctx) => {
@@ -461,17 +482,40 @@ export default {
       // Title: "RECOVERED: <old session title>" (numbered on duplicate,
       // RECOVERED:-prefix stripped; id-based fallback if API unavailable).
       const title = await recoveryTitleFor(ctx, sid, poison);
+      const pair = await recoveryPairFor(ctx, sid);
+      if (pair.agent || pair.model) {
+        log("info", `${sid}: inheriting pair for recovery session (agent=${pair.agent || "-"}, model=${pair.model ? pair.model.providerID + "/" + pair.model.id : "-"})`);
+      }
       let newSid = null;
       let seeded = false;
 
       if (hasCreate) {
         try {
-          const res = await ctx.session.create({ title });
+          const res = await ctx.session.create({ title, ...pair });
           newSid = res && typeof res === "object" ? (res.id || res.sessionID || res.session_id || null) : (typeof res === "string" ? res : null);
           if (newSid) log("info", `${sid}: recovery session created: ${newSid}`);
           else log("warn", `${sid}: session.create returned no id: ${JSON.stringify(res).slice(0, 120)}`);
         } catch (e) {
           log("error", `${sid}: session.create failed: ${e.message}`);
+        }
+      }
+
+      // Adapters may drop create fields they do not know — verify and repair
+      // with the dedicated switches when the pair did not land.
+      if (newSid && (pair.agent || pair.model)) {
+        try {
+          const fresh = typeof ctx.session?.get === "function" ? await ctx.session.get({ sessionID: newSid }) : null;
+          if (pair.agent && fresh && fresh.agent !== pair.agent && typeof ctx.session?.switchAgent === "function") {
+            await ctx.session.switchAgent({ sessionID: newSid, agent: pair.agent });
+            log("info", `${sid}: recovery session agent repaired to ${pair.agent}`);
+          }
+          const fm = fresh ? fresh.model : null;
+          if (pair.model && (!fm || fm.providerID !== pair.model.providerID || fm.id !== pair.model.id) && typeof ctx.session?.switchModel === "function") {
+            await ctx.session.switchModel({ sessionID: newSid, model: pair.model });
+            log("info", `${sid}: recovery session model repaired to ${pair.model.providerID}/${pair.model.id}`);
+          }
+        } catch (e) {
+          log("warn", `${sid}: pair verify/repair failed (best effort): ${e.message}`);
         }
       }
 
