@@ -107,10 +107,19 @@ If the number of knobs keeps growing, these may move into a dedicated
 
 ## Installation
 
+Requires opencode v2.0+ (any 2.0.x server; verified on v2.0.29). Uses only
+core session/model APIs — no experimental hooks.
+
 **Quick method (recommended):** download `index.js` from the latest
 [release](https://github.com/famewolf/opencode-sinkhole-guard/releases),
 drop it in a folder (e.g. `~/.config/opencode-v2/opencode/plugins/sinkhole-guard/`),
 register it (below), restart the server.
+
+One line (same thing, scripted):
+
+```sh
+mkdir -p ~/.config/opencode-v2/opencode/plugins/sinkhole-guard && curl -sL -o ~/.config/opencode-v2/opencode/plugins/sinkhole-guard/index.js https://github.com/famewolf/opencode-sinkhole-guard/releases/latest/download/index.js
+```
 
 **Manual method:** clone the repo, no build step (single-file plugin —
 `index.js` is the source):
@@ -131,6 +140,18 @@ Register it in `opencode.jsonc` (either method):
 ```
 
 The plugin loads on server start (and is hot-reloaded when `opencode.jsonc` changes). No other setup is required.
+
+## Updating
+
+Re-download `index.js` from the latest release over the installed copy and
+restart the server. Manual installs: `git pull` in the clone, re-copy the
+file, restart. There is no auto-update.
+
+## Uninstall
+
+Remove the plugin directory (or just its `index.js`), delete the entry from
+`opencode.jsonc`, restart the server.
+
 
 ## Verification
 
